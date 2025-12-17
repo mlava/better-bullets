@@ -77,7 +77,7 @@ For bullet types with configurable prefixes, the prefix input only appears when 
 
 - **Better Bullets: Enable all bullet types**
 - **Better Bullets: Disable all bullet types**
-- **Better Bullets: Show cheat sheet (console)**  
+- **Better Bullets: Show cheat sheet**  
   Prints a quick reference of enabled bullets, markers, and meanings.
 
 ---
@@ -114,4 +114,4 @@ You can customise sizing/alignment by overriding these variables (e.g. in your t
 ---
 
 ## License
-MIT (or your chosen license).
+MIT.

@@ -1,26 +1,5 @@
-/* =========================
-   Better Bullets — DB WATCH BUILD (addPullWatch) — ROBUST + LIGHTWEIGHT
-   Includes:
-   ✅ Require visible whitespace after marker (prevents v>test triggers when ON)
-   ✅ Strip markers optional, never while focused
-   ✅ Persisted type drives rendering; prefix fallback for instant UI
-   ✅ Command palette:
-      - Clear bullet type from focused block
-      - Enable all bullet types
-      - Disable all bullet types
-      - Show cheat sheet (console)
-   ✅ Configurable prefixes (currently: v> and ∴) — prefix input only shown when that glyph is enabled
-   ✅ Prefix collision detector is deduped + debounced (won’t spam console)
-   ✅ DOM apply pass is incremental + time-sliced (avoids full-page sweeps on every change)
-   ✅ Watch refresh is signature-based (won’t thrash addPullWatch when nothing changed)
-   ========================= */
-
-/* =========================
-   Bullet definitions
-   ========================= */
-
 const BULLET_TYPES = [
-  { id: "equal", label: 'Equal / definition (prefix "=")', prefix: "=", icon: "≡" },
+  { id: "equal", label: 'Equal / definition (prefix "=")', prefix: "=", icon: "=" },
   { id: "arrow", label: 'Single arrow / leads to (prefix "->")', prefix: "->", icon: "→" },
   { id: "doubleArrow", label: 'Double arrow / result (prefix "=>")', prefix: "=>", icon: "⇒" },
   { id: "question", label: 'Question (prefix "?")', prefix: "?", icon: "?" },
@@ -37,9 +16,8 @@ const BULLET_TYPES = [
   { id: "process", label: 'Process / ongoing (prefix "...")', prefix: "...", icon: "↻" },
 ];
 
-/* =========================
-   Settings state
-   ========================= */
+// Default enabled set for new installs (existing installs keep saved settings)
+const DEFAULT_ENABLED = new Set(["equal", "arrow", "doubleArrow", "question", "important"]);
 
 const bulletSettings = {
   enabled: {}, // id -> boolean (default ON)
@@ -49,10 +27,6 @@ const bulletSettings = {
 };
 
 const GLOBAL_KEY = "__better_bullets__v2";
-
-/* =========================
-   Persisted prop keys (read) + write key
-   ========================= */
 
 const PERSIST_PROP_TYPE_KEYS = [
   "::better-bullets/type",
@@ -64,50 +38,34 @@ const PERSIST_PROP_TYPE_KEYS = [
 ];
 
 const PERSIST_WRITE_KEY = "better-bullets/type";
-
-/* =========================
-   UID rules (CRITICAL FIX)
-   - Roam block UIDs are 9 chars and commonly include "-" / "_"
-   ========================= */
-
 const UID_RE = /^[-_A-Za-z0-9]{9}$/;
-
-/* =========================
-   Watch/observer state
-   ========================= */
 
 let domObserver = null;
 let watchRefreshTimer = null;
+let watchRefreshBurstUntil = 0;
+let watchRefreshQueued = false;
+let navCleanupFns = [];
+let sidebarWatchObserver = null;
 let refreshInFlight = false;
 
-// Watches keyed by "main:<uid>" or "rs:<window-id>:<uid>"
 const activeWatches = new Map(); // key -> unwatchFn
 let lastWatchSignature = "";
 
-// Avoid stripping while focused; retry shortly after blur
 const pendingFocusedStrip = new Map(); // uid -> timer
 let focusoutTimerByUid = new Map();
 let focusOutListener = null;
 
-// Cache to avoid pulling props repeatedly in DOM observer
 const typeCache = new Map(); // uid -> typeId|null (short-lived)
 let cacheEvictTimer = null;
 
-// DOM apply batching
 const dirtyContainers = new Set(); // Set<HTMLElement>
 let applyQueued = false;
 let applyContinuationTimer = null;
 
-// Prefix collision detector dedupe/debounce
 let lastPrefixSig = "";
 let prefixDetectTimer = null;
 
-// Optional debug
 const DEBUG_DETECT = false;
-
-/* =========================
-   Utilities
-   ========================= */
 
 function getSettingBool(extensionAPI, key, defaultValue) {
   const v = extensionAPI.settings.get(key);
@@ -166,7 +124,7 @@ function safeUpdateBlock(payload) {
   if (!window.roamAlphaAPI?.updateBlock) return;
   try {
     const res = window.roamAlphaAPI.updateBlock(payload);
-    if (res?.catch) res.catch(() => {});
+    if (res?.catch) res.catch(() => { });
   } catch {
     // ignore
   }
@@ -205,11 +163,6 @@ function getBlockUidFromContainer(container) {
   return null;
 }
 
-/* =========================
-   Prefix detection
-   - Require VISIBLE whitespace when requireSpaceAfterMarker is ON
-   ========================= */
-
 const VISIBLE_SPACE_AFTER = "(?:[\\t \\u00A0\\u202F]|$)";
 
 function getBulletTypeByPrefixFromString(blockString) {
@@ -242,10 +195,6 @@ function buildStripRegex(prefix) {
     )}[\\s\\u00A0\\u202F\\u200B\\u200C\\u200D\\uFEFF\\u2060\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]*)+`
   );
 }
-
-/* =========================
-   Persistence
-   ========================= */
 
 function readPersistedType(uid) {
   if (!window.roamAlphaAPI || !isValidUid(uid)) return null;
@@ -293,10 +242,6 @@ function clearPersistedType(uid) {
   });
 }
 
-/* =========================
-   Stripping (verified, skip focused uid)
-   ========================= */
-
 async function stripMarkerFromUid(uid, bulletType, focusedUid) {
   if (!window.roamAlphaAPI) return false;
   if (!bulletSettings.stripMarkers) return true;
@@ -333,10 +278,6 @@ async function stripMarkerFromUid(uid, bulletType, focusedUid) {
 
   return true;
 }
-
-/* =========================
-   Focus-handling: strip after unfocus (for focused blocks)
-   ========================= */
 
 function scheduleStripWhenUnfocused(uid, bulletType) {
   if (!bulletSettings.stripMarkers) return;
@@ -436,10 +377,6 @@ function stopFocusOutListener() {
   focusoutTimerByUid.clear();
 }
 
-/* =========================
-   Rendering (classes)
-   ========================= */
-
 function clearBetterBulletClasses(container) {
   const toRemove = [];
   container.classList.forEach((c) => {
@@ -484,19 +421,68 @@ function applyFromPropsOrPrefix(container) {
   applyBulletClass(container, null);
 }
 
-/* =========================
-   Incremental DOM apply pass (time-sliced)
-   ========================= */
-
 function markContainerDirty(container) {
   if (!container || container.nodeType !== 1) return;
   if (!container.classList?.contains("roam-block-container")) return;
   dirtyContainers.add(container);
 }
 
+
+function getBulletRoots() {
+  const roots = [];
+  try {
+    const main = document.querySelector(".roam-main");
+    if (main) roots.push(main);
+  } catch { }
+  try {
+    const rs = document.querySelector(".rm-right-sidebar");
+    if (rs) roots.push(rs);
+  } catch { }
+  if (!roots.length) roots.push(document.body);
+  return roots;
+}
+
+function safeCssEscape(s) {
+  try {
+    return CSS && typeof CSS.escape === "function" ? CSS.escape(s) : s;
+  } catch {
+    return s;
+  }
+}
+
+function markContainersDirtyForUids(uids) {
+  let marked = 0;
+  if (!uids || !uids.length) return marked;
+
+  const roots = getBulletRoots();
+
+  for (const uid of uids) {
+    if (!uid || typeof uid !== "string") continue;
+
+    const sel = `[id$="${safeCssEscape(uid)}"]`;
+    let foundForUid = false;
+
+    for (const root of roots) {
+      if (!root || !root.querySelectorAll) continue;
+
+      const els = root.querySelectorAll(sel);
+      for (const el of els) {
+        const c = el.closest?.(".roam-block-container");
+        if (c) {
+          markContainerDirty(c);
+          marked++;
+          foundForUid = true;
+          break;
+        }
+      }
+      if (foundForUid) break;
+    }
+  }
+
+  return marked;
+}
+
 function markAllVisibleContainersDirtyLight() {
-  // “Light” fallback: only mark a limited number of containers to avoid massive sweeps.
-  // This is used after operations where we can’t easily locate exact containers.
   try {
     const nodes = document.querySelectorAll(".roam-block-container");
     const max = 250; // hard cap to prevent huge work
@@ -522,7 +508,6 @@ function scheduleDomApplyPass() {
 }
 
 function processDirtyContainers() {
-  // Time-slice to avoid long rAF handlers
   const BUDGET_MS = 10;
   const start = performance.now();
 
@@ -544,15 +529,10 @@ function processDirtyContainers() {
   }
 
   if (dirtyContainers.size) {
-    // Continue soon (not necessarily next rAF) to keep UI responsive
     if (applyContinuationTimer) clearTimeout(applyContinuationTimer);
     applyContinuationTimer = setTimeout(() => scheduleDomApplyPass(), 25);
   }
 }
-
-/* =========================
-   DB watch diff processing
-   ========================= */
 
 function flattenTreeToMap(node, map) {
   if (!node) return;
@@ -601,11 +581,6 @@ async function handleChangedBlock(uid, afterEntry, focusedUid) {
     await stripMarkerFromUid(uid, detected, null);
   }
 }
-
-/* =========================
-   addPullWatch wiring + initial scan
-   ========================= */
-
 const PULL_SPEC = "[:block/uid :block/string :block/props {:block/children ...}]";
 
 async function initialScanForRootUid(rootUid) {
@@ -623,8 +598,7 @@ async function initialScanForRootUid(rootUid) {
     for (const [uid, entry] of map) {
       await handleChangedBlock(uid, entry, focusedUid);
     }
-
-    // Don’t sweep whole page; just do a light mark and apply incrementally
+    
     markAllVisibleContainersDirtyLight();
     scheduleDomApplyPass();
   } catch {
@@ -656,9 +630,9 @@ function addWatchForUid(key, uid) {
         if (!entry) continue;
         await handleChangedBlock(changedUid, entry, focusedUid);
       }
-
-      // Avoid full sweep; mark light set and apply incrementally
-      markAllVisibleContainersDirtyLight();
+      
+      const marked = markContainersDirtyForUids(changedUids);
+      if (!marked) markAllVisibleContainersDirtyLight();
       scheduleDomApplyPass();
     } catch {
       // ignore
@@ -666,7 +640,7 @@ function addWatchForUid(key, uid) {
   });
 
   const unwatchFn = typeof unwatch === "function" ? unwatch : null;
-  activeWatches.set(key, unwatchFn || (() => {}));
+  activeWatches.set(key, unwatchFn || (() => { }));
 
   initialScanForRootUid(uid);
 }
@@ -681,10 +655,6 @@ function removeWatch(key) {
   }
   activeWatches.delete(key);
 }
-
-/* =========================
-   Watch refresh logic (main + sidebar)
-   ========================= */
 
 async function getMainUid() {
   try {
@@ -763,9 +733,113 @@ async function refreshWatches() {
   }
 }
 
-/* =========================
-   Minimal DOM observer: mark containers dirty on added nodes
-   ========================= */
+
+function scheduleRefreshWatches(reason) {
+  try {
+    watchRefreshBurstUntil = Date.now() + 8000;
+  } catch { }
+
+  if (watchRefreshQueued) return;
+  watchRefreshQueued = true;
+
+  setTimeout(() => {
+    watchRefreshQueued = false;
+    refreshWatches();
+  }, 150);
+}
+
+function installNavigationRefreshHooks() {
+  const cleanups = [];
+
+  try {
+    const onVis = () => {
+      if (!document.hidden) scheduleRefreshWatches("visibility");
+    };
+    document.addEventListener("visibilitychange", onVis);
+    cleanups.push(() => document.removeEventListener("visibilitychange", onVis));
+  } catch { }
+
+  try {
+    const onHash = () => scheduleRefreshWatches("hashchange");
+    window.addEventListener("hashchange", onHash);
+    cleanups.push(() => window.removeEventListener("hashchange", onHash));
+  } catch { }
+
+  try {
+    const onPop = () => scheduleRefreshWatches("popstate");
+    window.addEventListener("popstate", onPop);
+    cleanups.push(() => window.removeEventListener("popstate", onPop));
+  } catch { }
+  
+  try {
+    const origPush = history.pushState;
+    const origReplace = history.replaceState;
+
+    const wrap = (orig) =>
+      function () {
+        const res = orig.apply(this, arguments);
+        scheduleRefreshWatches("history");
+        return res;
+      };
+
+    history.pushState = wrap(origPush);
+    history.replaceState = wrap(origReplace);
+
+    cleanups.push(() => {
+      try { history.pushState = origPush; } catch { }
+      try { history.replaceState = origReplace; } catch { }
+    });
+  } catch { }
+  
+  try {
+    const rs = document.querySelector(".rm-right-sidebar");
+    if (rs) {
+      sidebarWatchObserver = new MutationObserver(() => scheduleRefreshWatches("sidebar"));
+      sidebarWatchObserver.observe(rs, { childList: true, subtree: true });
+      cleanups.push(() => {
+        try { sidebarWatchObserver.disconnect(); } catch { }
+        sidebarWatchObserver = null;
+      });
+    }
+  } catch { }
+
+  navCleanupFns = cleanups;
+}
+
+function uninstallNavigationRefreshHooks() {
+  try {
+    navCleanupFns.forEach((fn) => {
+      try { fn(); } catch { }
+    });
+  } catch { }
+  navCleanupFns = [];
+}
+
+function startWatchRefreshLoop() {
+  if (watchRefreshTimer) return;
+
+  installNavigationRefreshHooks();
+
+  watchRefreshTimer = setInterval(() => {
+    const now = Date.now();
+    const shouldPoll = now < watchRefreshBurstUntil;
+    if (shouldPoll) {
+      refreshWatches();
+    } else {
+      // Slow poll when idle
+      refreshWatches();
+    }
+  }, 8000);
+}
+
+function stopWatchRefreshLoop() {
+  try {
+    if (watchRefreshTimer) clearInterval(watchRefreshTimer);
+  } catch { }
+  watchRefreshTimer = null;
+
+  uninstallNavigationRefreshHooks();
+}
 
 function startDomObserver() {
   if (domObserver) return;
@@ -796,7 +870,11 @@ function startDomObserver() {
     if (saw) scheduleDomApplyPass();
   });
 
-  domObserver.observe(document.body, { childList: true, subtree: true });
+  getBulletRoots().forEach((root) => {
+    try {
+      domObserver.observe(root, { childList: true, subtree: true });
+    } catch { }
+  });
 }
 
 function stopDomObserver() {
@@ -804,15 +882,11 @@ function stopDomObserver() {
   domObserver = null;
 }
 
-/* =========================
-   Cache eviction (keep memory bounded)
-   ========================= */
-
 function startCacheEvictor() {
   if (cacheEvictTimer) return;
   cacheEvictTimer = setInterval(() => {
     if (typeCache.size > 2000) typeCache.clear();
-  }, 5000);
+  }, 30000);
 }
 
 function stopCacheEvictor() {
@@ -820,10 +894,6 @@ function stopCacheEvictor() {
   clearInterval(cacheEvictTimer);
   cacheEvictTimer = null;
 }
-
-/* =========================
-   Prefix collision detector (deduped + debounced)
-   ========================= */
 
 function computePrefixSignature() {
   const parts = [];
@@ -849,8 +919,7 @@ function detectPrefixCollisions() {
   }
 
   const lines = [];
-
-  // Duplicates
+  
   for (const [p, ids] of prefixToIds) {
     if (!p) continue;
     if (ids.length > 1) {
@@ -861,8 +930,7 @@ function detectPrefixCollisions() {
       }
     }
   }
-
-  // Starts-with collisions (note)
+  
   for (let i = 0; i < enabled.length; i++) {
     for (let j = 0; j < enabled.length; j++) {
       if (i === j) continue;
@@ -901,13 +969,7 @@ function schedulePrefixCollisionDetect(force = false) {
   }, 180);
 }
 
-/* =========================
-   Command palette
-   ========================= */
-
 function registerCommands(extensionAPI) {
-  // Note (per you): Roam auto-cleans command palette registrations on unload,
-  // so we do NOT removeCommand().
   extensionAPI.ui.commandPalette.addCommand({
     label: "Better Bullets: Clear bullet type from focused block",
     callback: () => {
@@ -963,35 +1025,75 @@ function registerCommands(extensionAPI) {
   });
 
   extensionAPI.ui.commandPalette.addCommand({
-    label: "Better Bullets: Show cheat sheet (console)",
+    label: "Better Bullets: Show cheat sheet",
     callback: () => {
       try {
-        console.info("[Better Bullets] Cheat sheet");
-        console.info("Better Bullets — Cheat Sheet");
-        console.info("----------------------------------------");
+        const lines = [];
+        lines.push("Better Bullets — Cheat Sheet");
+        lines.push("----------------------------------------");
         BULLET_TYPES.forEach((bt) => {
           const prefix = getEffectivePrefix(bt);
           const on = isBulletTypeEnabled(bt.id);
           const status = on ? "" : " (disabled)";
-          console.info(`${bt.icon}  ${bt.id}  —  ${prefix}  —  ${bt.label}${status}`);
+          lines.push(`${bt.icon}  ${bt.id}  —  ${prefix}  —  ${bt.label}${status}`);
         });
+
+        showBetterBulletsCheatSheet();
       } catch {
         // ignore
       }
     },
   });
-}
 
-/* =========================
-   Settings UI (dynamic rebuild)
-   ========================= */
+  function showBetterBulletsCheatSheet() {
+    const CORE_IDS = new Set([
+      "equal",
+      "arrow",
+      "doubleArrow",
+      "question",
+      "important",
+    ]);
+
+    const lines = [];
+
+    lines.push(
+      "Better Bullets — Cheat Sheet",
+      "----------------------------",
+      "",
+      "Core (enabled by default)"
+    );
+
+    BULLET_TYPES
+      .filter(b => CORE_IDS.has(b.id))
+      .forEach(b => {
+        lines.push(
+          `${b.icon}               ${b.label.padEnd(22)} `
+        );
+      });
+
+    lines.push(
+      "",
+      "Optional (enable in settings)"
+    );
+
+    BULLET_TYPES
+      .filter(b => !CORE_IDS.has(b.id))
+      .forEach(b => {
+        lines.push(
+          `${b.icon}               ${b.label.padEnd(22)} `
+        );
+      });
+
+    alert(lines.join("\n"));
+  }
+}
 
 function hydrateSettingsFromRoam(extensionAPI) {
   bulletSettings.stripMarkers = getSettingBool(extensionAPI, "bb-strip-markers", false);
   bulletSettings.requireSpaceAfterMarker = getSettingBool(extensionAPI, "bb-require-space", true);
 
   BULLET_TYPES.forEach((bt) => {
-    bulletSettings.enabled[bt.id] = getSettingBool(extensionAPI, `bb-enable-${bt.id}`, true);
+    bulletSettings.enabled[bt.id] = getSettingBool(extensionAPI, `bb-enable-${bt.id}`, DEFAULT_ENABLED.has(bt.id));
     if (bt.configurablePrefix) {
       bulletSettings.prefixes[bt.id] = getSettingStr(extensionAPI, `bb-prefix-${bt.id}`, bt.prefix);
     }
@@ -1053,19 +1155,17 @@ function buildSettingsConfig(extensionAPI) {
           const enabled = !!(e?.target?.checked ?? e?.value ?? e);
           bulletSettings.enabled[bt.id] = enabled;
           extensionAPI.settings.set(`bb-enable-${bt.id}`, enabled);
-
-          // Rebuild panel so configurable prefix inputs show/hide immediately
+          
           rebuildSettingsPanel(extensionAPI);
 
           typeCache.clear();
-          schedulePrefixCollisionDetect(); // signature-based, won’t spam
+          schedulePrefixCollisionDetect();
           markAllVisibleContainersDirtyLight();
           scheduleDomApplyPass();
         },
       },
     });
-
-    // Configurable prefix input ONLY when enabled is ON (default hidden when OFF)
+    
     if (bt.configurablePrefix && enabledNow) {
       settings.push({
         id: `bb-prefix-${bt.id}`,
@@ -1082,7 +1182,7 @@ function buildSettingsConfig(extensionAPI) {
             extensionAPI.settings.set(`bb-prefix-${bt.id}`, next);
 
             typeCache.clear();
-            schedulePrefixCollisionDetect(); // signature-based
+            schedulePrefixCollisionDetect();
             markAllVisibleContainersDirtyLight();
             scheduleDomApplyPass();
           },
@@ -1099,7 +1199,6 @@ function buildSettingsConfig(extensionAPI) {
 
 function rebuildSettingsPanel(extensionAPI) {
   try {
-    // Ensure our in-memory reflects latest persisted settings before building
     hydrateSettingsFromRoam(extensionAPI);
     extensionAPI.settings.panel.create(buildSettingsConfig(extensionAPI));
   } catch (err) {
@@ -1107,13 +1206,8 @@ function rebuildSettingsPanel(extensionAPI) {
   }
 }
 
-/* =========================
-   Lifecycle
-   ========================= */
-
 export default {
   onload: ({ extensionAPI }) => {
-    // Kill any previous instance (dev reload safety)
     if (window[GLOBAL_KEY]?.unload) {
       try {
         window[GLOBAL_KEY].unload();
@@ -1125,8 +1219,7 @@ export default {
     // Hydrate settings first so the panel shows correct dynamic fields immediately
     hydrateSettingsFromRoam(extensionAPI);
     rebuildSettingsPanel(extensionAPI);
-
-    // Command palette (no removeCommand needed)
+    
     registerCommands(extensionAPI);
 
     // Observer + cache + focus
@@ -1136,66 +1229,57 @@ export default {
 
     // Watches
     refreshWatches();
-
-    // Initial apply: don’t sweep everything; mark a light set and apply incrementally
+    
     markAllVisibleContainersDirtyLight();
     scheduleDomApplyPass();
-
-    // Prefix collision detector: run once on load (deduped thereafter)
+    
     schedulePrefixCollisionDetect(true);
-
-    // Refresh watches periodically, but signature-based to avoid thrash
-    watchRefreshTimer = setInterval(() => {
-      refreshWatches();
-    }, 1200);
+    
+    startWatchRefreshLoop();
 
     window[GLOBAL_KEY] = {
       unload: () => {
         try {
           stopDomObserver();
-        } catch {}
+        } catch { }
 
         try {
           stopCacheEvictor();
-        } catch {}
+        } catch { }
 
         try {
           stopFocusOutListener();
-        } catch {}
+        } catch { }
 
         try {
-          if (watchRefreshTimer) {
-            clearInterval(watchRefreshTimer);
-            watchRefreshTimer = null;
-          }
-        } catch {}
+          stopWatchRefreshLoop();
+        } catch { }
 
         try {
           if (prefixDetectTimer) {
             clearTimeout(prefixDetectTimer);
             prefixDetectTimer = null;
           }
-        } catch {}
+        } catch { }
 
         try {
           if (applyContinuationTimer) {
             clearTimeout(applyContinuationTimer);
             applyContinuationTimer = null;
           }
-        } catch {}
+        } catch { }
 
         try {
           for (const t of pendingFocusedStrip.values()) clearTimeout(t);
           pendingFocusedStrip.clear();
-        } catch {}
+        } catch { }
 
         try {
           for (const key of Array.from(activeWatches.keys())) removeWatch(key);
           activeWatches.clear();
-        } catch {}
+        } catch { }
 
         try {
-          // Best-effort cleanup of classes (light)
           const nodes = document.querySelectorAll(".roam-block-container");
           const max = 300;
           let i = 0;
@@ -1209,12 +1293,12 @@ export default {
             i++;
             if (i >= max) break;
           }
-        } catch {}
+        } catch { }
 
         try {
           typeCache.clear();
           dirtyContainers.clear();
-        } catch {}
+        } catch { }
       },
     };
   },
