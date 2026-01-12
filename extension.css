@@ -1,3 +1,7 @@
+:root {
+    --bb-bullet-translate-y: 1.25px;
+}
+
 /* ========== Better Bullets base styles ========== */
 
 /* Force custom bullets to remain visible */
@@ -26,6 +30,10 @@
   min-height: var(--bb-bullet-size, 14px) !important;
   line-height: var(--bb-bullet-size, 14px) !important;
   transform: translateY(var(--bb-bullet-translate-y, 0px));
+}
+
+:root {
+  --bb-bullet-translate-y: 1px;
 }
 
 /* Keep block controls visible */

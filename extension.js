@@ -17,7 +17,7 @@ const BULLET_TYPES = [
 ];
 
 // Default enabled set for new installs (existing installs keep saved settings)
-const DEFAULT_ENABLED = new Set(["equal", "arrow", "doubleArrow", "question", "important"]);
+const DEFAULT_ENABLED = new Set();
 
 const bulletSettings = {
   enabled: {}, // id -> boolean (default ON)
@@ -67,11 +67,37 @@ let prefixDetectTimer = null;
 
 const DEBUG_DETECT = false;
 
+function parseBool(value) {
+  if (value === true || value === false) return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (v === "true" || v === "on" || v === "yes" || v === "1") return true;
+    if (v === "false" || v === "off" || v === "no" || v === "0") return false;
+  }
+  return null;
+}
+
+function coerceBoolInput(input) {
+  let value = input;
+  if (value && typeof value === "object") {
+    if ("target" in value) {
+      value = value.target?.checked ?? value.target?.value;
+    } else if ("value" in value) {
+      value = value.value;
+    }
+  }
+  const parsed = parseBool(value);
+  return parsed === null ? !!value : parsed;
+}
+
 function getSettingBool(extensionAPI, key, defaultValue) {
   const v = extensionAPI.settings.get(key);
-  if (v === true || v === "true") return true;
-  if (v === false || v === "false") return false;
-  return defaultValue;
+  const parsed = parseBool(v);
+  return parsed === null ? defaultValue : parsed;
 }
 
 function getSettingStr(extensionAPI, key, defaultValue) {
@@ -492,6 +518,16 @@ function markAllVisibleContainersDirtyLight() {
       i++;
       if (i >= max) break;
     }
+  } catch {
+    // ignore
+  }
+}
+
+function markAllVisibleContainersDirtyFull() {
+  try {
+    document.querySelectorAll(".roam-block-container").forEach((n) => {
+      markContainerDirty(n);
+    });
   } catch {
     // ignore
   }
@@ -992,7 +1028,6 @@ function registerCommands(extensionAPI) {
       try {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = true;
-          extensionAPI.settings.set(`bb-enable-${bt.id}`, true);
         });
         rebuildSettingsPanel(extensionAPI);
         typeCache.clear();
@@ -1011,7 +1046,6 @@ function registerCommands(extensionAPI) {
       try {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = false;
-          extensionAPI.settings.set(`bb-enable-${bt.id}`, false);
         });
         rebuildSettingsPanel(extensionAPI);
         typeCache.clear();
@@ -1089,13 +1123,40 @@ function registerCommands(extensionAPI) {
 }
 
 function hydrateSettingsFromRoam(extensionAPI) {
-  bulletSettings.stripMarkers = getSettingBool(extensionAPI, "bb-strip-markers", false);
-  bulletSettings.requireSpaceAfterMarker = getSettingBool(extensionAPI, "bb-require-space", true);
+  const stripKey = "bb-strip-markers";
+  const reqSpaceKey = "bb-require-space";
+
+  const stripRaw = extensionAPI.settings.get(stripKey);
+  const reqSpaceRaw = extensionAPI.settings.get(reqSpaceKey);
+
+  bulletSettings.stripMarkers = getSettingBool(extensionAPI, stripKey, false);
+  bulletSettings.requireSpaceAfterMarker = getSettingBool(extensionAPI, reqSpaceKey, true);
+
+  if (stripRaw === undefined || stripRaw === null) {
+    extensionAPI.settings.set(stripKey, bulletSettings.stripMarkers);
+  }
+  if (reqSpaceRaw === undefined || reqSpaceRaw === null) {
+    extensionAPI.settings.set(reqSpaceKey, bulletSettings.requireSpaceAfterMarker);
+  }
 
   BULLET_TYPES.forEach((bt) => {
-    bulletSettings.enabled[bt.id] = getSettingBool(extensionAPI, `bb-enable-${bt.id}`, DEFAULT_ENABLED.has(bt.id));
+    const enableKey = `bb-enable-${bt.id}`;
+    const enableRaw = extensionAPI.settings.get(enableKey);
+    const enabled = getSettingBool(extensionAPI, enableKey, DEFAULT_ENABLED.has(bt.id));
+    bulletSettings.enabled[bt.id] = enabled;
+
+    if (enableRaw === undefined || enableRaw === null) {
+      extensionAPI.settings.set(enableKey, enabled);
+    }
+
     if (bt.configurablePrefix) {
-      bulletSettings.prefixes[bt.id] = getSettingStr(extensionAPI, `bb-prefix-${bt.id}`, bt.prefix);
+      const prefixKey = `bb-prefix-${bt.id}`;
+      const prefixRaw = extensionAPI.settings.get(prefixKey);
+      const prefix = getSettingStr(extensionAPI, prefixKey, bt.prefix);
+      bulletSettings.prefixes[bt.id] = prefix;
+      if (prefixRaw === undefined || prefixRaw === null) {
+        extensionAPI.settings.set(prefixKey, prefix);
+      }
     }
   });
 }
@@ -1111,9 +1172,8 @@ function buildSettingsConfig(extensionAPI) {
     action: {
       type: "switch",
       onChange: (e) => {
-        const enabled = !!(e?.target?.checked ?? e?.value ?? e);
+        const enabled = coerceBoolInput(e);
         bulletSettings.requireSpaceAfterMarker = enabled;
-        extensionAPI.settings.set("bb-require-space", enabled);
 
         typeCache.clear();
         markAllVisibleContainersDirtyLight();
@@ -1130,9 +1190,8 @@ function buildSettingsConfig(extensionAPI) {
     action: {
       type: "switch",
       onChange: (e) => {
-        const enabled = !!(e?.target?.checked ?? e?.value ?? e);
+        const enabled = coerceBoolInput(e);
         bulletSettings.stripMarkers = enabled;
-        extensionAPI.settings.set("bb-strip-markers", enabled);
 
         typeCache.clear();
         refreshWatches();
@@ -1152,15 +1211,14 @@ function buildSettingsConfig(extensionAPI) {
       action: {
         type: "switch",
         onChange: (e) => {
-          const enabled = !!(e?.target?.checked ?? e?.value ?? e);
+          const enabled = coerceBoolInput(e);
           bulletSettings.enabled[bt.id] = enabled;
-          extensionAPI.settings.set(`bb-enable-${bt.id}`, enabled);
           
           rebuildSettingsPanel(extensionAPI);
 
           typeCache.clear();
           schedulePrefixCollisionDetect();
-          markAllVisibleContainersDirtyLight();
+          markAllVisibleContainersDirtyFull();
           scheduleDomApplyPass();
         },
       },
@@ -1179,7 +1237,6 @@ function buildSettingsConfig(extensionAPI) {
             const next = raw.length ? raw : bt.prefix;
 
             bulletSettings.prefixes[bt.id] = next;
-            extensionAPI.settings.set(`bb-prefix-${bt.id}`, next);
 
             typeCache.clear();
             schedulePrefixCollisionDetect();

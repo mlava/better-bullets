@@ -49,7 +49,7 @@ Optional:
 | Conclusion / synthesis | `∴` (configurable) | `∴` |
 | Hypothesis / tentative | `??` | `◊` |
 | Depends on / prerequisite | `<-` | `↤` |
-| Decision / choice | `|` | `⎇` |
+| Decision / choice | `\|` | `⎇` |
 | Reference / related | `@` | `↗` |
 | Process / ongoing | `...` | `↻` |
 
