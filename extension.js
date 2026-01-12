@@ -1029,7 +1029,7 @@ function registerCommands(extensionAPI) {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = true;
         });
-        rebuildSettingsPanel(extensionAPI);
+        rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
         typeCache.clear();
         schedulePrefixCollisionDetect(true);
         markAllVisibleContainersDirtyLight();
@@ -1047,7 +1047,7 @@ function registerCommands(extensionAPI) {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = false;
         });
-        rebuildSettingsPanel(extensionAPI);
+        rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
         typeCache.clear();
         schedulePrefixCollisionDetect(true);
         markAllVisibleContainersDirtyLight();
@@ -1214,7 +1214,7 @@ function buildSettingsConfig(extensionAPI) {
           const enabled = coerceBoolInput(e);
           bulletSettings.enabled[bt.id] = enabled;
           
-          rebuildSettingsPanel(extensionAPI);
+          rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
 
           typeCache.clear();
           schedulePrefixCollisionDetect();
@@ -1254,9 +1254,11 @@ function buildSettingsConfig(extensionAPI) {
   };
 }
 
-function rebuildSettingsPanel(extensionAPI) {
+function rebuildSettingsPanel(extensionAPI, options = {}) {
   try {
-    hydrateSettingsFromRoam(extensionAPI);
+    if (!options.skipHydrate) {
+      hydrateSettingsFromRoam(extensionAPI);
+    }
     extensionAPI.settings.panel.create(buildSettingsConfig(extensionAPI));
   } catch (err) {
     console.warn("[Better Bullets] failed to rebuild settings panel", err);
