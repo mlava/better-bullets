@@ -1028,6 +1028,7 @@ function registerCommands(extensionAPI) {
       try {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = true;
+          extensionAPI.settings.set(`bb-enable-${bt.id}`, true);
         });
         rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
         typeCache.clear();
@@ -1046,6 +1047,7 @@ function registerCommands(extensionAPI) {
       try {
         BULLET_TYPES.forEach((bt) => {
           bulletSettings.enabled[bt.id] = false;
+          extensionAPI.settings.set(`bb-enable-${bt.id}`, false);
         });
         rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
         typeCache.clear();
@@ -1171,9 +1173,11 @@ function buildSettingsConfig(extensionAPI) {
       'If enabled (default), markers only trigger when followed by a space/tab/NBSP or end-of-line (e.g. "-> hello"). Turn off to allow "->hello".',
     action: {
       type: "switch",
+      value: bulletSettings.requireSpaceAfterMarker,
       onChange: (e) => {
         const enabled = coerceBoolInput(e);
         bulletSettings.requireSpaceAfterMarker = enabled;
+        extensionAPI.settings.set("bb-require-space", enabled);
 
         typeCache.clear();
         markAllVisibleContainersDirtyLight();
@@ -1189,9 +1193,11 @@ function buildSettingsConfig(extensionAPI) {
       'If enabled, leading markers like "->", "=>", "??", "..." are removed after recognition. Bullet type is preserved via block props.',
     action: {
       type: "switch",
+      value: bulletSettings.stripMarkers,
       onChange: (e) => {
         const enabled = coerceBoolInput(e);
         bulletSettings.stripMarkers = enabled;
+        extensionAPI.settings.set("bb-strip-markers", enabled);
 
         typeCache.clear();
         refreshWatches();
@@ -1210,9 +1216,11 @@ function buildSettingsConfig(extensionAPI) {
       description: "Toggle this bullet type.",
       action: {
         type: "switch",
+        value: enabledNow,
         onChange: (e) => {
           const enabled = coerceBoolInput(e);
           bulletSettings.enabled[bt.id] = enabled;
+          extensionAPI.settings.set(`bb-enable-${bt.id}`, enabled);
           
           rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
 
@@ -1237,6 +1245,7 @@ function buildSettingsConfig(extensionAPI) {
             const next = raw.length ? raw : bt.prefix;
 
             bulletSettings.prefixes[bt.id] = next;
+            extensionAPI.settings.set(`bb-prefix-${bt.id}`, next);
 
             typeCache.clear();
             schedulePrefixCollisionDetect();
