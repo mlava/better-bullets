@@ -32,10 +32,6 @@
   transform: translateY(var(--bb-bullet-translate-y, 0px));
 }
 
-:root {
-  --bb-bullet-translate-y: 1px;
-}
-
 /* Keep block controls visible */
 .roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-block__controls,
 .roam-block-container[class*="better-bullet-"] > .rm-block-main .controls {
