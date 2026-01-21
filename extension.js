@@ -47,6 +47,7 @@ let watchRefreshQueued = false;
 let navCleanupFns = [];
 let sidebarWatchObserver = null;
 let refreshInFlight = false;
+let warnedMissingBlockUid = false;
 
 const activeWatches = new Map(); // key -> unwatchFn
 let lastWatchSignature = "";
@@ -165,25 +166,14 @@ function getFocusedUidFromDom() {
 }
 
 function getBlockUidFromContainer(container) {
-  if (!container || !container.querySelectorAll) return null;
+  if (!container) return null;
 
-  const candidates = container.querySelectorAll(
-    "textarea[id], .rm-block__input[id], [id^='block-input-'], [id*='block-input-']"
-  );
+  const directUid = container.getAttribute?.("data-block-uid");
+  if (isValidUid(directUid)) return directUid;
 
-  for (const el of candidates) {
-    const id = el && typeof el.id === "string" ? el.id : "";
-    if (!id || id.length < 9) continue;
-    const uid = id.slice(-9);
-    if (UID_RE.test(uid)) return uid;
-  }
-
-  const any = container.querySelectorAll("[id]");
-  for (const el of any) {
-    const id = el && typeof el.id === "string" ? el.id : "";
-    if (!id || id.length < 9) continue;
-    const uid = id.slice(-9);
-    if (UID_RE.test(uid)) return uid;
+  if (!warnedMissingBlockUid) {
+    warnedMissingBlockUid = true;
+    console.warn("[Better Bullets] Missing data-block-uid on block container:", container);
   }
 
   return null;
