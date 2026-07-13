@@ -1,25 +1,28 @@
 :root {
     --bb-bullet-translate-y: 1.25px;
+    --bb-prov-badge-size: 10px;
+    --bb-prov-badge-gap: 4px;
+    --bb-prov-badge-opacity: 0.75;
 }
 
 /* ========== Better Bullets base styles ========== */
 
 /* Force custom bullets to remain visible */
-.roam-block-container[class*="better-bullet-"] .bp3-popover-wrapper,
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .bp3-popover-wrapper,
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .bp3-popover-target,
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-bullet {
+.roam-block-container[data-better-bullet] .bp3-popover-wrapper,
+.roam-block-container[data-better-bullet] > .rm-block-main .bp3-popover-wrapper,
+.roam-block-container[data-better-bullet] > .rm-block-main .bp3-popover-target,
+.roam-block-container[data-better-bullet] > .rm-block-main .rm-bullet {
   opacity: 1 !important;
   visibility: visible !important;
 }
 
 /* Hide default bullet dot */
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-bullet__inner {
+.roam-block-container[data-better-bullet] > .rm-block-main .rm-bullet__inner {
   opacity: 0 !important;
 }
 
 /* Consistent bullet box */
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-bullet {
+.roam-block-container[data-better-bullet] > .rm-block-main .rm-bullet {
   position: relative;
   display: inline-flex !important;
   align-items: center;
@@ -33,20 +36,20 @@
 }
 
 /* Keep block controls visible */
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-block__controls,
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .controls {
+.roam-block-container[data-better-bullet] > .rm-block-main .rm-block__controls,
+.roam-block-container[data-better-bullet] > .rm-block-main .controls {
   opacity: 1 !important;
   visibility: visible !important;
 }
 
 /* Hide expand caret unless hovered */
-.roam-block-container[class*="better-bullet-"] > .rm-block-main:not(:hover)
+.roam-block-container[data-better-bullet] > .rm-block-main:not(:hover)
 .rm-block__controls .block-expand {
   opacity: 0 !important;
 }
 
 /* Generic bullet icon container */
-.roam-block-container[class*="better-bullet-"] > .rm-block-main .rm-bullet::after {
+.roam-block-container[data-better-bullet] > .rm-block-main .rm-bullet::after {
   position: absolute;
   inset: 0;
   display: flex;
@@ -62,18 +65,58 @@
   pointer-events: none;
 }
 
-.roam-block-container.better-bullet-equal       > .rm-block-main .rm-bullet::after { content: "="; }
-.roam-block-container.better-bullet-arrow       > .rm-block-main .rm-bullet::after { content: "→"; }
-.roam-block-container.better-bullet-doubleArrow > .rm-block-main .rm-bullet::after { content: "⇒"; }
-.roam-block-container.better-bullet-question    > .rm-block-main .rm-bullet::after { content: "?"; }
-.roam-block-container.better-bullet-important   > .rm-block-main .rm-bullet::after { content: "!"; }
-.roam-block-container.better-bullet-plus        > .rm-block-main .rm-bullet::after { content: "+"; }
-.roam-block-container.better-bullet-downRight90 > .rm-block-main .rm-bullet::after { content: "⤷"; }
-.roam-block-container.better-bullet-contrast    > .rm-block-main .rm-bullet::after { content: "≠"; }
-.roam-block-container.better-bullet-evidence    > .rm-block-main .rm-bullet::after { content: "▸"; }
-.roam-block-container.better-bullet-conclusion  > .rm-block-main .rm-bullet::after { content: "∴"; }
-.roam-block-container.better-bullet-hypothesis  > .rm-block-main .rm-bullet::after { content: "◊"; }
-.roam-block-container.better-bullet-depends     > .rm-block-main .rm-bullet::after { content: "↤"; }
-.roam-block-container.better-bullet-decision    > .rm-block-main .rm-bullet::after { content: "⎇"; }
-.roam-block-container.better-bullet-reference   > .rm-block-main .rm-bullet::after { content: "↗"; }
-.roam-block-container.better-bullet-process     > .rm-block-main .rm-bullet::after { content: "↻"; }
+/* Keyed off data-better-bullet, NOT the better-bullet-* class.
+   Roam owns className on .roam-block-container via React, and rewrites it
+   wholesale whenever the block's editing state changes (focus/blur) — which
+   silently strips any class we added. React does not manage unknown data-*
+   attributes, so those survive the re-render.
+
+   Driving BOTH the base styles above and the glyph below off the same attribute
+   keeps the two atomic: attribute present means styled + glyphed, absent means
+   untouched. Splitting them across attribute and class produced a half-state on
+   blur (dot hidden, no glyph) that rendered as an empty bullet box.
+
+   The better-bullet-* classes are still applied as a best-effort hook for user
+   theming, but they are unreliable across re-renders — do not depend on them. */
+.roam-block-container[data-better-bullet="equal"]       > .rm-block-main .rm-bullet::after { content: "="; }
+.roam-block-container[data-better-bullet="arrow"]       > .rm-block-main .rm-bullet::after { content: "→"; }
+.roam-block-container[data-better-bullet="doubleArrow"] > .rm-block-main .rm-bullet::after { content: "⇒"; }
+.roam-block-container[data-better-bullet="question"]    > .rm-block-main .rm-bullet::after { content: "?"; }
+.roam-block-container[data-better-bullet="important"]   > .rm-block-main .rm-bullet::after { content: "!"; }
+.roam-block-container[data-better-bullet="plus"]        > .rm-block-main .rm-bullet::after { content: "+"; }
+.roam-block-container[data-better-bullet="downRight90"] > .rm-block-main .rm-bullet::after { content: "⤷"; }
+.roam-block-container[data-better-bullet="contrast"]    > .rm-block-main .rm-bullet::after { content: "≠"; }
+.roam-block-container[data-better-bullet="evidence"]    > .rm-block-main .rm-bullet::after { content: "▸"; }
+.roam-block-container[data-better-bullet="conclusion"]  > .rm-block-main .rm-bullet::after { content: "∴"; }
+.roam-block-container[data-better-bullet="hypothesis"]  > .rm-block-main .rm-bullet::after { content: "◊"; }
+.roam-block-container[data-better-bullet="depends"]     > .rm-block-main .rm-bullet::after { content: "↤"; }
+.roam-block-container[data-better-bullet="decision"]    > .rm-block-main .rm-bullet::after { content: "⎇"; }
+.roam-block-container[data-better-bullet="reference"]   > .rm-block-main .rm-bullet::after { content: "↗"; }
+.roam-block-container[data-better-bullet="process"]     > .rm-block-main .rm-bullet::after { content: "↻"; }
+
+/* ========== Provenance badge styles ========== */
+
+/* The badge flows inline ahead of the block text rather than being positioned
+   over it, so it reserves its own space and cannot collide with the bullet or
+   the first characters of the block. It renders on .rm-block-text, which Roam
+   swaps for a textarea while the block is focused — so the badge is hidden
+   during editing and returns on blur. */
+.roam-block-container[data-better-bullet-prov] > .rm-block-main .rm-block-text::before {
+  display: inline-block;
+  vertical-align: baseline;
+  font-size: var(--bb-prov-badge-size, 10px);
+  line-height: 1;
+  margin-right: var(--bb-prov-badge-gap, 4px);
+  opacity: var(--bb-prov-badge-opacity, 0.75);
+  pointer-events: none;
+}
+
+/* Per-provenance-type emoji badges. Attribute-keyed for the same reason as the
+   bullet glyphs above: Roam's React re-render strips our classes on focus/blur,
+   but leaves data-* attributes alone. */
+.roam-block-container[data-better-bullet-prov="calendar"] > .rm-block-main .rm-block-text::before { content: "\1F4C5"; }
+.roam-block-container[data-better-bullet-prov="email"]    > .rm-block-main .rm-block-text::before { content: "\1F4E8"; }
+.roam-block-container[data-better-bullet-prov="phone"]    > .rm-block-main .rm-block-text::before { content: "\1F4DE"; }
+.roam-block-container[data-better-bullet-prov="chat"]     > .rm-block-main .rm-block-text::before { content: "\1F4AC"; }
+.roam-block-container[data-better-bullet-prov="mail"]     > .rm-block-main .rm-block-text::before { content: "\1F4EA"; }
+.roam-block-container[data-better-bullet-prov="slack"]    > .rm-block-main .rm-block-text::before { content: "\FF03"; }

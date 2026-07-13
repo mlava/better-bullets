@@ -16,6 +16,23 @@ const BULLET_TYPES = [
   { id: "process", label: 'Process / ongoing (prefix "...")', prefix: "...", icon: "↻" },
 ];
 
+// Every provenance type has a configurable prefix: the emoji defaults are hard to
+// type and easy to confuse with lookalikes (U+1F4E8 vs U+1F4E7), so users need to
+// be able to swap in something typeable. The prefix input is only revealed once
+// the type is enabled.
+const PROVENANCE_TYPES = [
+  { id: "calendar", label: "Calendar event", prefix: "\u{1F4C5}", icon: "\u{1F4C5}", configurablePrefix: true },
+  { id: "email", label: "Email", prefix: "\u{1F4E8}", icon: "\u{1F4E8}", configurablePrefix: true },
+  { id: "phone", label: "Phone call", prefix: "\u{1F4DE}", icon: "\u{1F4DE}", configurablePrefix: true },
+  { id: "chat", label: "Chat message", prefix: "\u{1F4AC}", icon: "\u{1F4AC}", configurablePrefix: true },
+  { id: "mail", label: "Scanned post", prefix: "\u{1F4EA}", icon: "\u{1F4EA}", configurablePrefix: true },
+  // Prefix is "%", not "#": a leading "#" is Roam's H1 heading shortcut *and* its
+  // tag autocomplete trigger. The badge still renders the fullwidth "\uFF03" (U+FF03),
+  // which is Slack-evocative but effectively untypeable \u2014 prefix and badge are
+  // independent, so the prefix is chosen purely for typeability.
+  { id: "slack", label: "Slack", prefix: "%", icon: "\uFF03", configurablePrefix: true },
+];
+
 // Default enabled set for new installs (existing installs keep saved settings)
 const DEFAULT_ENABLED = new Set();
 
@@ -24,6 +41,9 @@ const bulletSettings = {
   stripMarkers: false,
   requireSpaceAfterMarker: true, // default ON
   prefixes: {}, // id -> string (configurable prefix overrides)
+  provEnabled: {}, // id -> boolean (provenance types)
+  provPrefixes: {}, // id -> string (provenance prefix overrides)
+  stripProvMarkers: false,
 };
 
 const GLOBAL_KEY = "__better_bullets__v2";
@@ -38,6 +58,13 @@ const PERSIST_PROP_TYPE_KEYS = [
 ];
 
 const PERSIST_WRITE_KEY = "better-bullets/type";
+
+const PERSIST_PROV_PROP_KEYS = [
+  "::better-bullets/provenance",
+  ":better-bullets/provenance",
+  "better-bullets/provenance",
+];
+const PERSIST_PROV_WRITE_KEY = "better-bullets/provenance";
 const UID_RE = /^[-_A-Za-z0-9]{9}$/;
 
 let domObserver = null;
@@ -57,6 +84,7 @@ let focusoutTimerByUid = new Map();
 let focusOutListener = null;
 
 const typeCache = new Map(); // uid -> typeId|null (short-lived)
+const provCache = new Map(); // uid -> provId|null (short-lived)
 let cacheEvictTimer = null;
 
 const dirtyContainers = new Set(); // Set<HTMLElement>
@@ -147,14 +175,43 @@ function getPropValue(props, keys) {
   return undefined;
 }
 
-function safeUpdateBlock(payload) {
-  if (!window.roamAlphaAPI?.updateBlock) return;
-  try {
-    const res = window.roamAlphaAPI.updateBlock(payload);
-    if (res?.catch) res.catch(() => { });
-  } catch {
-    // ignore
-  }
+// Serialises prop writes per block. Roam's updateBlock replaces :block/props
+// wholesale, so each write is a read-modify-write to avoid clobbering props owned
+// by other extensions. That makes concurrent writes to the SAME block unsafe: a
+// combined block persists provenance and type in the same tick, and without this
+// queue the second write would pull props before the first had landed and drop
+// the first key. The in-memory caches hide the damage until a reload, and with
+// stripping on the props are the only source of truth — so the loss is permanent.
+//
+// staleKeys lists every key spelling our value may already be stored under; they
+// are dropped before the patch is applied, otherwise an older spelling would
+// shadow the fresh value in getPropValue's ordered lookup.
+const propWriteQueue = new Map(); // uid -> Promise (tail of that block's write chain)
+
+function safeMergeProps(uid, patch, staleKeys = []) {
+  if (!window.roamAlphaAPI || !isValidUid(uid)) return;
+
+  const prev = propWriteQueue.get(uid) || Promise.resolve();
+
+  const next = prev
+    .then(async () => {
+      const pulled = window.roamAlphaAPI.pull("[:block/props]", [":block/uid", uid]);
+      const current = { ...(pulled?.[":block/props"] || {}) };
+      for (const k of staleKeys) delete current[k];
+
+      const res = window.roamAlphaAPI.updateBlock({
+        block: { uid, props: { ...current, ...patch } },
+      });
+      if (res?.then) await res;
+    })
+    .catch(() => {
+      // A failed write must not poison the rest of the chain.
+    })
+    .finally(() => {
+      if (propWriteQueue.get(uid) === next) propWriteQueue.delete(uid);
+    });
+
+  propWriteQueue.set(uid, next);
 }
 
 function getFocusedUidFromDom() {
@@ -223,6 +280,13 @@ function readPersistedType(uid) {
     const typeId = getPropValue(props, PERSIST_PROP_TYPE_KEYS);
     const val = typeof typeId === "string" && typeId ? typeId : null;
     typeCache.set(uid, val);
+
+    // Opportunistically warm provCache from the same pull
+    if (!provCache.has(uid)) {
+      const provId = getPropValue(props, PERSIST_PROV_PROP_KEYS);
+      provCache.set(uid, typeof provId === "string" && provId ? provId : null);
+    }
+
     return val;
   } catch {
     typeCache.set(uid, null);
@@ -234,29 +298,137 @@ function persistType(uid, bulletType) {
   if (!window.roamAlphaAPI || !isValidUid(uid) || !bulletType) return;
 
   typeCache.set(uid, bulletType.id);
-  safeUpdateBlock({
-    block: {
-      uid,
-      props: {
-        [PERSIST_WRITE_KEY]: bulletType.id,
-      },
-    },
-  });
+  safeMergeProps(uid, { [PERSIST_WRITE_KEY]: bulletType.id }, PERSIST_PROP_TYPE_KEYS);
 }
 
 function clearPersistedType(uid) {
   if (!window.roamAlphaAPI || !isValidUid(uid)) return;
 
   typeCache.set(uid, null);
-  safeUpdateBlock({
-    block: {
-      uid,
-      props: {
-        [PERSIST_WRITE_KEY]: null,
-      },
-    },
-  });
+  safeMergeProps(uid, { [PERSIST_WRITE_KEY]: null }, PERSIST_PROP_TYPE_KEYS);
 }
+
+// --- Provenance helpers (mirrors reasoning helpers above) ---
+
+function isProvTypeEnabled(id) {
+  if (Object.prototype.hasOwnProperty.call(bulletSettings.provEnabled, id)) {
+    return !!bulletSettings.provEnabled[id];
+  }
+  return false; // all disabled by default
+}
+
+function getProvTypeById(id) {
+  return PROVENANCE_TYPES.find((p) => p.id === id) || null;
+}
+
+function getEffectiveProvPrefix(pt) {
+  const override = bulletSettings.provPrefixes?.[pt.id];
+  if (typeof override === "string" && override.length) return override;
+  return pt.prefix;
+}
+
+function getProvTypeByPrefixFromString(blockString) {
+  const trimmed = stripLeadingInvisibles(blockString);
+
+  for (const pt of PROVENANCE_TYPES) {
+    if (!isProvTypeEnabled(pt.id)) continue;
+
+    const prefix = getEffectiveProvPrefix(pt);
+
+    const re = bulletSettings.requireSpaceAfterMarker
+      ? new RegExp(`^${escapeRegExp(prefix)}${VISIBLE_SPACE_AFTER}`)
+      : new RegExp(`^${escapeRegExp(prefix)}`);
+
+    if (re.test(trimmed)) {
+      // Strip the provenance prefix (+ optional trailing space) to produce remainder
+      const stripRe = new RegExp(
+        `^${escapeRegExp(prefix)}[\\t \\u00A0\\u202F]*`
+      );
+      const remainder = trimmed.replace(stripRe, "");
+      return { provType: pt, remainder };
+    }
+  }
+  return null;
+}
+
+function readPersistedProv(uid) {
+  if (!window.roamAlphaAPI || !isValidUid(uid)) return null;
+
+  if (provCache.has(uid)) return provCache.get(uid);
+
+  try {
+    const pulled = window.roamAlphaAPI.pull("[:block/props]", [":block/uid", uid]);
+    const props = pulled?.[":block/props"];
+    const provId = getPropValue(props, PERSIST_PROV_PROP_KEYS);
+    const val = typeof provId === "string" && provId ? provId : null;
+    provCache.set(uid, val);
+    return val;
+  } catch {
+    provCache.set(uid, null);
+    return null;
+  }
+}
+
+function persistProvenance(uid, provType) {
+  if (!window.roamAlphaAPI || !isValidUid(uid) || !provType) return;
+
+  provCache.set(uid, provType.id);
+  safeMergeProps(uid, { [PERSIST_PROV_WRITE_KEY]: provType.id }, PERSIST_PROV_PROP_KEYS);
+}
+
+function clearPersistedProv(uid) {
+  if (!window.roamAlphaAPI || !isValidUid(uid)) return;
+
+  provCache.set(uid, null);
+  safeMergeProps(uid, { [PERSIST_PROV_WRITE_KEY]: null }, PERSIST_PROV_PROP_KEYS);
+}
+
+function buildProvStripRegex(prefix) {
+  return new RegExp(
+    `^[\\s\\u00A0\\u202F\\u200B\\u200C\\u200D\\uFEFF\\u2060\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]*(?:${escapeRegExp(
+      prefix
+    )}[\\s\\u00A0\\u202F\\u200B\\u200C\\u200D\\uFEFF\\u2060\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]*)+`
+  );
+}
+
+async function stripProvMarkerFromUid(uid, provType, focusedUid) {
+  if (!window.roamAlphaAPI) return false;
+  if (!bulletSettings.stripProvMarkers) return true;
+  if (!isValidUid(uid)) return false;
+  if (!provType) return false;
+  if (focusedUid && uid === focusedUid) return false;
+
+  const prefix = getEffectiveProvPrefix(provType);
+  if (!prefix) return false;
+
+  const re = buildProvStripRegex(prefix);
+
+  let pulled = window.roamAlphaAPI.pull("[:block/string]", [":block/uid", uid]);
+  let orig = pulled?.[":block/string"];
+  if (typeof orig !== "string") return false;
+
+  if (!re.test(orig)) return true;
+
+  const next = orig.replace(re, "");
+  if (next === orig) return true;
+
+  try {
+    const res = window.roamAlphaAPI.updateBlock({ block: { uid, string: next } });
+    if (res?.then) await res;
+  } catch {
+    // ignore; verify below
+  }
+
+  await new Promise((r) => setTimeout(r, 90));
+  pulled = window.roamAlphaAPI.pull("[:block/string]", [":block/uid", uid]);
+  const after = pulled?.[":block/string"];
+  if (typeof after !== "string") return false;
+  if (re.test(after)) return false;
+
+  return true;
+}
+
+// --- End provenance helpers ---
 
 async function stripMarkerFromUid(uid, bulletType, focusedUid) {
   if (!window.roamAlphaAPI) return false;
@@ -295,23 +467,29 @@ async function stripMarkerFromUid(uid, bulletType, focusedUid) {
   return true;
 }
 
-function scheduleStripWhenUnfocused(uid, bulletType) {
-  if (!bulletSettings.stripMarkers) return;
+function scheduleStripWhenUnfocused(uid, markerType, isProv) {
+  if (isProv && !bulletSettings.stripProvMarkers) return;
+  if (!isProv && !bulletSettings.stripMarkers) return;
   if (!isValidUid(uid)) return;
 
-  if (pendingFocusedStrip.has(uid)) clearTimeout(pendingFocusedStrip.get(uid));
+  const key = isProv ? `prov:${uid}` : uid;
+  if (pendingFocusedStrip.has(key)) clearTimeout(pendingFocusedStrip.get(key));
 
   const t = setTimeout(async () => {
-    pendingFocusedStrip.delete(uid);
+    pendingFocusedStrip.delete(key);
 
     const nowFocused = getFocusedUidFromDom();
     if (nowFocused === uid) {
-      scheduleStripWhenUnfocused(uid, bulletType);
+      scheduleStripWhenUnfocused(uid, markerType, isProv);
       return;
     }
 
     try {
-      await stripMarkerFromUid(uid, bulletType, null);
+      if (isProv) {
+        await stripProvMarkerFromUid(uid, markerType, null);
+      } else {
+        await stripMarkerFromUid(uid, markerType, null);
+      }
       markAllVisibleContainersDirtyLight();
       scheduleDomApplyPass();
     } catch {
@@ -319,11 +497,16 @@ function scheduleStripWhenUnfocused(uid, bulletType) {
     }
   }, 250);
 
-  pendingFocusedStrip.set(uid, t);
+  pendingFocusedStrip.set(key, t);
 }
 
+// Runs on every blur, even with both strip settings off. Blurring makes Roam
+// re-render the block (textarea back to .rm-block-text) and rewrite className,
+// and the DOM observer only watches for added .roam-block-container nodes — so
+// it never sees that swap. Without an unconditional repaint here, a block that
+// lost its marker state while focused would only recover on a page nav or when
+// a sibling block is inserted.
 function scheduleStripAfterFocusout(uid) {
-  if (!bulletSettings.stripMarkers) return;
   if (!isValidUid(uid)) return;
 
   if (focusoutTimerByUid.has(uid)) clearTimeout(focusoutTimerByUid.get(uid));
@@ -332,27 +515,49 @@ function scheduleStripAfterFocusout(uid) {
     focusoutTimerByUid.delete(uid);
 
     try {
-      const typeId = readPersistedType(uid);
-      const btFromProp = typeId ? getBulletTypeById(typeId) : null;
+      // --- Provenance stripping ---
+      if (bulletSettings.stripProvMarkers) {
+        const provId = readPersistedProv(uid);
+        const ptFromProp = provId ? getProvTypeById(provId) : null;
 
-      if (btFromProp && isBulletTypeEnabled(btFromProp.id)) {
-        await stripMarkerFromUid(uid, btFromProp, null);
-        markAllVisibleContainersDirtyLight();
-        scheduleDomApplyPass();
-        return;
+        if (ptFromProp && isProvTypeEnabled(ptFromProp.id)) {
+          await stripProvMarkerFromUid(uid, ptFromProp, null);
+        } else {
+          const pulled = window.roamAlphaAPI?.pull?.("[:block/string]", [":block/uid", uid]);
+          const str = pulled?.[":block/string"];
+          if (typeof str === "string") {
+            const provResult = getProvTypeByPrefixFromString(str);
+            if (provResult && isProvTypeEnabled(provResult.provType.id)) {
+              persistProvenance(uid, provResult.provType);
+              await stripProvMarkerFromUid(uid, provResult.provType, null);
+            }
+          }
+        }
       }
 
-      const pulled = window.roamAlphaAPI?.pull?.("[:block/string]", [":block/uid", uid]);
-      const str = pulled?.[":block/string"];
-      if (typeof str !== "string") return;
+      // --- Reasoning stripping ---
+      if (bulletSettings.stripMarkers) {
+        const typeId = readPersistedType(uid);
+        const btFromProp = typeId ? getBulletTypeById(typeId) : null;
 
-      const detected = getBulletTypeByPrefixFromString(str);
-      if (detected && isBulletTypeEnabled(detected.id)) {
-        persistType(uid, detected);
-        await stripMarkerFromUid(uid, detected, null);
-        markAllVisibleContainersDirtyLight();
-        scheduleDomApplyPass();
+        if (btFromProp && isBulletTypeEnabled(btFromProp.id)) {
+          await stripMarkerFromUid(uid, btFromProp, null);
+        } else {
+          const pulled = window.roamAlphaAPI?.pull?.("[:block/string]", [":block/uid", uid]);
+          const str = pulled?.[":block/string"];
+          if (typeof str === "string") {
+            const detected = getBulletTypeByPrefixFromString(str);
+            if (detected && isBulletTypeEnabled(detected.id)) {
+              persistType(uid, detected);
+              await stripMarkerFromUid(uid, detected, null);
+            }
+          }
+        }
       }
+
+      // Unconditional: the block was just re-rendered by the blur itself.
+      markAllVisibleContainersDirtyLight();
+      scheduleDomApplyPass();
     } catch {
       // ignore
     }
@@ -393,16 +598,24 @@ function stopFocusOutListener() {
   focusoutTimerByUid.clear();
 }
 
-function clearBetterBulletClasses(container) {
+function clearReasoningClasses(container) {
   const toRemove = [];
   container.classList.forEach((c) => {
-    if (c.startsWith("better-bullet-")) toRemove.push(c);
+    if (c.startsWith("better-bullet-") && !c.startsWith("better-bullet-prov-")) toRemove.push(c);
+  });
+  toRemove.forEach((c) => container.classList.remove(c));
+}
+
+function clearProvClasses(container) {
+  const toRemove = [];
+  container.classList.forEach((c) => {
+    if (c.startsWith("better-bullet-prov-")) toRemove.push(c);
   });
   toRemove.forEach((c) => container.classList.remove(c));
 }
 
 function applyBulletClass(container, typeId) {
-  clearBetterBulletClasses(container);
+  clearReasoningClasses(container);
 
   if (!typeId) {
     container.removeAttribute("data-better-bullet");
@@ -413,28 +626,61 @@ function applyBulletClass(container, typeId) {
   container.setAttribute("data-better-bullet", typeId);
 }
 
+function applyProvClass(container, provId) {
+  clearProvClasses(container);
+
+  if (!provId) {
+    container.removeAttribute("data-better-bullet-prov");
+    return;
+  }
+
+  container.classList.add(`better-bullet-prov-${provId}`);
+  container.setAttribute("data-better-bullet-prov", provId);
+}
+
 function applyFromPropsOrPrefix(container) {
   const uid = getBlockUidFromContainer(container);
+  const textEl = container.querySelector(".rm-block-text");
+  const raw = textEl?.innerText || "";
 
+  // Mirrors handleChangedBlock: provenance is read off the front of the string
+  // first, and reasoning is detected on what remains. Only disabled-type-free
+  // results come back, so a null here means "no provenance prefix".
+  const provResult = raw ? getProvTypeByPrefixFromString(raw) : null;
+
+  // --- Provenance dimension ---
+  let provApplied = false;
+  if (uid) {
+    const provId = readPersistedProv(uid);
+    const pt = provId ? getProvTypeById(provId) : null;
+    if (pt && isProvTypeEnabled(pt.id)) {
+      applyProvClass(container, pt.id);
+      provApplied = true;
+    }
+  }
+  if (!provApplied) {
+    applyProvClass(container, provResult ? provResult.provType.id : null);
+  }
+
+  // --- Reasoning dimension ---
+  let reasoningApplied = false;
   if (uid) {
     const typeId = readPersistedType(uid);
     const bt = typeId ? getBulletTypeById(typeId) : null;
     if (bt && isBulletTypeEnabled(bt.id)) {
       applyBulletClass(container, bt.id);
-      return;
+      reasoningApplied = true;
     }
   }
-
-  const textEl = container.querySelector(".rm-block-text");
-  const raw = textEl?.innerText || "";
-  const detected = raw ? getBulletTypeByPrefixFromString(raw) : null;
-
-  if (detected && isBulletTypeEnabled(detected.id)) {
-    applyBulletClass(container, detected.id);
-    return;
+  if (!reasoningApplied) {
+    const reasoningInput = provResult ? provResult.remainder : raw;
+    const detected = reasoningInput ? getBulletTypeByPrefixFromString(reasoningInput) : null;
+    if (detected && isBulletTypeEnabled(detected.id)) {
+      applyBulletClass(container, detected.id);
+    } else {
+      applyBulletClass(container, null);
+    }
   }
-
-  applyBulletClass(container, null);
 }
 
 function markContainerDirty(container) {
@@ -595,12 +841,32 @@ async function handleChangedBlock(uid, afterEntry, focusedUid) {
   const str = afterEntry?.string;
   if (typeof str !== "string") return;
 
-  const detected = getBulletTypeByPrefixFromString(str);
+  // Phase 1: Provenance detection (emoji prefix at start of string)
+  let reasoningInput = str;
+  const provResult = getProvTypeByPrefixFromString(str);
+  if (provResult && isProvTypeEnabled(provResult.provType.id)) {
+    persistProvenance(uid, provResult.provType);
+    reasoningInput = provResult.remainder;
+
+    if (bulletSettings.stripProvMarkers && focusedUid === uid) {
+      scheduleStripWhenUnfocused(uid, provResult.provType, true);
+    } else {
+      await stripProvMarkerFromUid(uid, provResult.provType, focusedUid);
+      // Re-read string after provenance strip for reasoning detection
+      if (bulletSettings.stripProvMarkers) {
+        const pulled = window.roamAlphaAPI?.pull?.("[:block/string]", [":block/uid", uid]);
+        reasoningInput = pulled?.[":block/string"] || reasoningInput;
+      }
+    }
+  }
+
+  // Phase 2: Reasoning detection (ASCII prefix on remainder)
+  const detected = getBulletTypeByPrefixFromString(reasoningInput);
   if (detected && isBulletTypeEnabled(detected.id)) {
     persistType(uid, detected);
 
     if (bulletSettings.stripMarkers && focusedUid === uid) {
-      scheduleStripWhenUnfocused(uid, detected);
+      scheduleStripWhenUnfocused(uid, detected, false);
       return;
     }
 
@@ -912,6 +1178,7 @@ function startCacheEvictor() {
   if (cacheEvictTimer) return;
   cacheEvictTimer = setInterval(() => {
     if (typeCache.size > 2000) typeCache.clear();
+    if (provCache.size > 2000) provCache.clear();
   }, 30000);
 }
 
@@ -927,7 +1194,13 @@ function computePrefixSignature() {
   for (const bt of BULLET_TYPES) {
     if (!isBulletTypeEnabled(bt.id)) continue;
     const prefix = getEffectivePrefix(bt) || "";
-    parts.push(`${bt.id}:${prefix}`);
+    parts.push(`r:${bt.id}:${prefix}`);
+  }
+
+  for (const pt of PROVENANCE_TYPES) {
+    if (!isProvTypeEnabled(pt.id)) continue;
+    const prefix = getEffectiveProvPrefix(pt) || "";
+    parts.push(`p:${pt.id}:${prefix}`);
   }
 
   parts.sort();
@@ -935,17 +1208,26 @@ function computePrefixSignature() {
 }
 
 function detectPrefixCollisions() {
-  const enabled = BULLET_TYPES.filter((bt) => isBulletTypeEnabled(bt.id));
+  const enabledReasoning = BULLET_TYPES.filter((bt) => isBulletTypeEnabled(bt.id));
+  const enabledProv = PROVENANCE_TYPES.filter((pt) => isProvTypeEnabled(pt.id));
 
+  // Collect all prefixes from both dimensions into a single map
   const prefixToIds = new Map();
-  for (const bt of enabled) {
+
+  for (const bt of enabledReasoning) {
     const p = getEffectivePrefix(bt) || "";
     if (!prefixToIds.has(p)) prefixToIds.set(p, []);
-    prefixToIds.get(p).push(bt.id);
+    prefixToIds.get(p).push(`reasoning:${bt.id}`);
+  }
+
+  for (const pt of enabledProv) {
+    const p = getEffectiveProvPrefix(pt) || "";
+    if (!prefixToIds.has(p)) prefixToIds.set(p, []);
+    prefixToIds.get(p).push(`provenance:${pt.id}`);
   }
 
   const lines = [];
-  
+
   for (const [p, ids] of prefixToIds) {
     if (!p) continue;
     if (ids.length > 1) {
@@ -956,17 +1238,21 @@ function detectPrefixCollisions() {
       }
     }
   }
-  
-  for (let i = 0; i < enabled.length; i++) {
-    for (let j = 0; j < enabled.length; j++) {
+
+  // Check substring overlaps across all enabled types
+  const allEnabled = [
+    ...enabledReasoning.map((bt) => ({ id: `reasoning:${bt.id}`, prefix: getEffectivePrefix(bt) || "" })),
+    ...enabledProv.map((pt) => ({ id: `provenance:${pt.id}`, prefix: getEffectiveProvPrefix(pt) || "" })),
+  ];
+
+  for (let i = 0; i < allEnabled.length; i++) {
+    for (let j = 0; j < allEnabled.length; j++) {
       if (i === j) continue;
-      const a = enabled[i];
-      const b = enabled[j];
-      const pa = getEffectivePrefix(a) || "";
-      const pb = getEffectivePrefix(b) || "";
-      if (!pa || !pb) continue;
-      if (pa !== pb && pa.startsWith(pb)) {
-        lines.push(` - note: Prefix "${pa}" ( ${a.id} ) starts with "${pb}" ( ${b.id} )`);
+      const a = allEnabled[i];
+      const b = allEnabled[j];
+      if (!a.prefix || !b.prefix) continue;
+      if (a.prefix !== b.prefix && a.prefix.startsWith(b.prefix)) {
+        lines.push(` - note: Prefix "${a.prefix}" ( ${a.id} ) starts with "${b.prefix}" ( ${b.id} )`);
       }
     }
   }
@@ -995,7 +1281,52 @@ function schedulePrefixCollisionDetect(force = false) {
   }, 180);
 }
 
+// Provenance lives in block props, so it can be set directly on the focused block
+// without typing a marker at all. One command per *enabled* type, re-synced when
+// the enabled set changes so the palette never lists types the user turned off.
+// Registered via extensionAPI, so they group under Better Bullets in the Hotkeys
+// window and users can bind their own keys.
+let provMarkCommandLabels = [];
+
+function provMarkCommandLabel(pt) {
+  return `Better Bullets: Mark as ${pt.icon} ${pt.label}`;
+}
+
+function syncProvMarkCommands(extensionAPI) {
+  try {
+    for (const label of provMarkCommandLabels) {
+      extensionAPI.ui.commandPalette.removeCommand({ label });
+    }
+    provMarkCommandLabels = [];
+
+    for (const pt of PROVENANCE_TYPES) {
+      if (!isProvTypeEnabled(pt.id)) continue;
+
+      const label = provMarkCommandLabel(pt);
+      extensionAPI.ui.commandPalette.addCommand({
+        label,
+        callback: () => {
+          try {
+            const uid = getFocusedUidFromDom();
+            if (!uid) return;
+            persistProvenance(uid, pt);
+            markAllVisibleContainersDirtyLight();
+            scheduleDomApplyPass();
+          } catch {
+            // ignore
+          }
+        },
+      });
+      provMarkCommandLabels.push(label);
+    }
+  } catch (err) {
+    console.warn("[Better Bullets] failed to sync provenance commands", err);
+  }
+}
+
 function registerCommands(extensionAPI) {
+  syncProvMarkCommands(extensionAPI);
+
   extensionAPI.ui.commandPalette.addCommand({
     label: "Better Bullets: Clear bullet type from focused block",
     callback: () => {
@@ -1004,6 +1335,40 @@ function registerCommands(extensionAPI) {
         if (!uid) return;
         clearPersistedType(uid);
         typeCache.delete(uid);
+        markAllVisibleContainersDirtyLight();
+        scheduleDomApplyPass();
+      } catch {
+        // ignore
+      }
+    },
+  });
+
+  extensionAPI.ui.commandPalette.addCommand({
+    label: "Better Bullets: Clear provenance from focused block",
+    callback: () => {
+      try {
+        const uid = getFocusedUidFromDom();
+        if (!uid) return;
+        clearPersistedProv(uid);
+        provCache.delete(uid);
+        markAllVisibleContainersDirtyLight();
+        scheduleDomApplyPass();
+      } catch {
+        // ignore
+      }
+    },
+  });
+
+  extensionAPI.ui.commandPalette.addCommand({
+    label: "Better Bullets: Clear all markers from focused block",
+    callback: () => {
+      try {
+        const uid = getFocusedUidFromDom();
+        if (!uid) return;
+        clearPersistedType(uid);
+        clearPersistedProv(uid);
+        typeCache.delete(uid);
+        provCache.delete(uid);
         markAllVisibleContainersDirtyLight();
         scheduleDomApplyPass();
       } catch {
@@ -1110,6 +1475,20 @@ function registerCommands(extensionAPI) {
         );
       });
 
+    lines.push(
+      "",
+      "Provenance (enable in settings)"
+    );
+
+    PROVENANCE_TYPES.forEach(p => {
+      const prefix = getEffectiveProvPrefix(p);
+      const on = isProvTypeEnabled(p.id);
+      const status = on ? "" : " (disabled)";
+      lines.push(
+        `${p.icon}  ${prefix.padEnd(4)}  ${p.label}${status}`
+      );
+    });
+
     alert(lines.join("\n"));
   }
 }
@@ -1146,6 +1525,35 @@ function hydrateSettingsFromRoam(extensionAPI) {
       const prefixRaw = extensionAPI.settings.get(prefixKey);
       const prefix = getSettingStr(extensionAPI, prefixKey, bt.prefix);
       bulletSettings.prefixes[bt.id] = prefix;
+      if (prefixRaw === undefined || prefixRaw === null) {
+        extensionAPI.settings.set(prefixKey, prefix);
+      }
+    }
+  });
+
+  // --- Provenance settings ---
+  const stripProvKey = "bb-strip-prov-markers";
+  const stripProvRaw = extensionAPI.settings.get(stripProvKey);
+  bulletSettings.stripProvMarkers = getSettingBool(extensionAPI, stripProvKey, false);
+  if (stripProvRaw === undefined || stripProvRaw === null) {
+    extensionAPI.settings.set(stripProvKey, bulletSettings.stripProvMarkers);
+  }
+
+  PROVENANCE_TYPES.forEach((pt) => {
+    const enableKey = `bb-prov-enable-${pt.id}`;
+    const enableRaw = extensionAPI.settings.get(enableKey);
+    const enabled = getSettingBool(extensionAPI, enableKey, false);
+    bulletSettings.provEnabled[pt.id] = enabled;
+
+    if (enableRaw === undefined || enableRaw === null) {
+      extensionAPI.settings.set(enableKey, enabled);
+    }
+
+    if (pt.configurablePrefix) {
+      const prefixKey = `bb-prov-prefix-${pt.id}`;
+      const prefixRaw = extensionAPI.settings.get(prefixKey);
+      const prefix = getSettingStr(extensionAPI, prefixKey, pt.prefix);
+      bulletSettings.provPrefixes[pt.id] = prefix;
       if (prefixRaw === undefined || prefixRaw === null) {
         extensionAPI.settings.set(prefixKey, prefix);
       }
@@ -1247,6 +1655,98 @@ function buildSettingsConfig(extensionAPI) {
     }
   });
 
+  // --- Provenance section (progressive disclosure) ---
+  const showProv = getSettingBool(extensionAPI, "bb-show-provenance", false);
+
+  settings.push({
+    id: "bb-show-provenance",
+    name: "Show provenance settings",
+    description: "Provenance types mark the source of content (e.g. email, phone, calendar). Enable this to configure them.",
+    action: {
+      type: "switch",
+      value: showProv,
+      onChange: () => {
+        setTimeout(() => {
+          rebuildSettingsPanel(extensionAPI, { skipHydrate: false });
+        }, 60);
+      },
+    },
+  });
+
+  if (showProv) {
+    settings.push({
+      id: "bb-strip-prov-markers",
+      name: "Strip provenance prefix from text",
+      description:
+        'If enabled, provenance marker prefixes (emoji) are removed after recognition. Provenance type is preserved via block props.',
+      action: {
+        type: "switch",
+        value: bulletSettings.stripProvMarkers,
+        onChange: (e) => {
+          const enabled = coerceBoolInput(e);
+          bulletSettings.stripProvMarkers = enabled;
+          extensionAPI.settings.set("bb-strip-prov-markers", enabled);
+
+          provCache.clear();
+          refreshWatches();
+          markAllVisibleContainersDirtyLight();
+          scheduleDomApplyPass();
+        },
+      },
+    });
+
+    PROVENANCE_TYPES.forEach((pt) => {
+      const enabledNow = isProvTypeEnabled(pt.id);
+
+      settings.push({
+        id: `bb-prov-enable-${pt.id}`,
+        name: `Enable: ${pt.icon} ${pt.label}`,
+        description: `Toggle this provenance type (prefix: ${getEffectiveProvPrefix(pt)}).`,
+        action: {
+          type: "switch",
+          value: enabledNow,
+          onChange: (e) => {
+            const enabled = coerceBoolInput(e);
+            bulletSettings.provEnabled[pt.id] = enabled;
+            extensionAPI.settings.set(`bb-prov-enable-${pt.id}`, enabled);
+
+            rebuildSettingsPanel(extensionAPI, { skipHydrate: true });
+            syncProvMarkCommands(extensionAPI);
+
+            provCache.clear();
+            schedulePrefixCollisionDetect();
+            markAllVisibleContainersDirtyFull();
+            scheduleDomApplyPass();
+          },
+        },
+      });
+
+      if (pt.configurablePrefix && enabledNow) {
+        settings.push({
+          id: `bb-prov-prefix-${pt.id}`,
+          name: `Prefix for: ${pt.id}`,
+          description: `Customise the trigger prefix for "${pt.id}" (default: "${pt.prefix}").`,
+          action: {
+            type: "input",
+            placeholder: pt.prefix,
+            onChange: (v) => {
+              const raw = (v?.target?.value ?? v?.value ?? v ?? "").toString();
+              const next = raw.length ? raw : pt.prefix;
+
+              bulletSettings.provPrefixes[pt.id] = next;
+              extensionAPI.settings.set(`bb-prov-prefix-${pt.id}`, next);
+
+              provCache.clear();
+              schedulePrefixCollisionDetect();
+              markAllVisibleContainersDirtyLight();
+              scheduleDomApplyPass();
+            },
+          },
+        });
+      }
+    });
+  }
+
   return {
     tabTitle: "Better Bullets",
     settings,
@@ -1343,6 +1843,7 @@ export default {
           let i = 0;
           for (const c of nodes) {
             c.removeAttribute("data-better-bullet");
+            c.removeAttribute("data-better-bullet-prov");
             const toRemove = [];
             c.classList.forEach((cls) => {
               if (cls.startsWith("better-bullet-")) toRemove.push(cls);
@@ -1353,8 +1854,14 @@ export default {
           }
         } catch { }
 
+        // extensionAPI commands are removed automatically on unload; just drop the
+        // labels so a re-load starts from a clean slate.
+        provMarkCommandLabels = [];
+
         try {
           typeCache.clear();
+          provCache.clear();
+          propWriteQueue.clear();
           dirtyContainers.clear();
         } catch { }
       },
